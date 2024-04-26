@@ -1,0 +1,175 @@
+#pragma once
+
+#include <map>
+#include <memory>
+#include <vector>
+#include "alg/mgcbs/h_table.hpp"
+#include "env/environment.hpp"
+#include "base/agent.hpp"
+#include "alg/base_algorithm.hpp"
+#include "alg/mgcbs/siforest.hpp"
+#include "alg/mgcbs/mgcbs_mid.hpp"
+namespace mg_cbs {
+class MGCBSHigh: public BaseAlgorithm {
+ public:
+  explicit MGCBSHigh(const Environment& environment)
+      : env_(environment), middle_level_search_(environment) {}
+
+  virtual bool Search(const std::vector<Agent>& agents,
+                      std::vector<PlanResult>* solution) {
+    solution->clear();
+    HighLevelNode start;
+    h_tables_.clear();
+    h_tables_.reserve(agents.size());
+
+    for (uint i = 0; i < agents.size(); i++) {
+      auto &agent = agents[i];
+      start.siforests.emplace_back(std::make_shared<SIForest>(env_));
+      start.siforests.back()->Build(agent, Constraints());
+      std::vector<std::vector<int>> distance_matrix =
+          std::vector<std::vector<int>>(
+              agents[i].targets.size(),
+              std::vector<int>(agent.targets.size(), Interval::oo));
+      for (int j = 0; j< static_cast<int>(agent.targets.size()); j++) {
+        for (int k = 1; k < static_cast<int>(agent.targets.size()); k++) {
+          distance_matrix[j][k] =
+              start.siforests.back()->GetNextTargetReachTime(
+                  TSState(0, agent.targets[j].x, agent.targets[j].y), k, 0);
+        }
+      }
+      h_tables_.emplace_back();
+      h_tables_.back().Build(distance_matrix);
+    }
+    start.solution.reserve(agents.size());
+    start.constraints.reserve(agents.size());
+    start.cost = 0;
+    start.id = 0;
+    for (size_t i = 0; i < agents.size(); ++i) {
+      start.solution.emplace_back(std::make_shared<PlanResult>());
+      start.constraints.emplace_back(std::make_shared<Constraints>());
+      bool success = middle_level_search_.Search(
+          agents[i], *(start.siforests[i]), h_tables_[i], *start.constraints[i],
+          &(*(start.solution[i])));
+      if (!success) {
+        return false;
+      }
+      start.cost += start.solution[i]->cost;
+    }
+
+    boost::heap::d_ary_heap<HighLevelNode, boost::heap::arity<2>,
+                                     boost::heap::mutable_<true>> open;
+
+    open.push(start);
+
+    solution->clear();
+
+    int id = 1;
+    while (!open.empty()) {
+      HighLevelNode p = open.top();
+      open.pop();
+      Conflict conflict;
+      if (!env_.GetFirstConflict(p.solution, &conflict)) {
+        for (auto& s : p.solution) solution->emplace_back(*s);
+        return true;
+      }
+      std::map<size_t, Constraints> constraints;
+      env_.CreateConstraintsFromConflict(conflict, constraints);
+      for (const auto& c : constraints) {
+        size_t i = c.first;
+        HighLevelNode new_node = p;
+        new_node.id = id;
+        new_node.constraints[i] =
+            std::make_shared<Constraints>(*(new_node.constraints[i]));
+        new_node.constraints[i]->Add(c.second);
+        new_node.siforests[i] = std::make_shared<SIForest>(env_);
+        new_node.siforests[i]->Build(agents[i], *(new_node.constraints[i]));
+        new_node.cost -= new_node.solution[i]->cost;
+
+        new_node.solution[i] = std::make_shared<PlanResult>();
+
+        bool success = middle_level_search_.Search(
+            agents[i], *(new_node.siforests[i]), h_tables_[i],
+            *(new_node.constraints[i]), &(*(new_node.solution[i])));
+
+        if (success &&
+            !Check(*(new_node.solution[i]), *new_node.constraints[i])) {
+          std::cout << "Error. Constraint not meet" << std::endl;
+          exit(0);
+        }
+        new_node.cost += new_node.solution[i]->cost;
+
+        if (success) {
+          open.push(new_node);
+        }
+        ++id;
+      }
+    }
+    return false;
+  }
+  bool Check(const PlanResult &result, const Constraints &con) {
+    for (const auto& iter1 : con.vertex_constraints) {
+      for (const auto& vc : iter1.second) {
+        if (vc.time < static_cast<int>(result.states.size()) &&
+            result.states[vc.time].GetLocation() == Location(vc.x, vc.y)) {
+          std::cout << "Error. vc:" << vc << std::endl;
+          for (auto& state : result.states) {
+            std::cout << state << " ";
+          }
+          std::cout << std::endl;
+          return false;
+        }
+      }
+    }
+    for (const auto& iter1 : con.edge_constraints) {
+      for (const auto& ec : iter1.second) {
+        if (ec.time + 1 < static_cast<int>(result.states.size()) &&
+            result.states[ec.time].GetLocation() == Location(ec.x1, ec.y1) &&
+            result.states[ec.time + 1].GetLocation() ==
+                Location(ec.x2, ec.y2)) {
+          std::cout << "Error. ec:" << ec << std::endl;
+          for (auto& state : result.states) {
+            std::cout << state << " ";
+          }
+          std::cout << std::endl;
+          return false;
+        }
+      }
+    }
+    return true;
+  }
+
+ private:
+  struct HighLevelNode {
+    std::vector<PlanResultPtr> solution;
+    std::vector<ConstraintsPtr> constraints;
+    std::vector<SIForestPtr> siforests;
+    int cost;
+    int id;
+
+    bool operator<(const HighLevelNode& n) const {
+      return cost > n.cost;
+    }
+
+    friend std::ostream& operator<<(std::ostream& os, const HighLevelNode& c) {
+      os << "id: " << c.id << " cost: " << c.cost << std::endl;
+      for (size_t i = 0; i < c.solution.size(); ++i) {
+        os << "Agent: " << i << std::endl;
+        os << " States:" << std::endl;
+        for (size_t t = 0; t < c.solution[i]->states.size(); ++t) {
+          os << "  " << c.solution[i]->states[t] << std::endl;
+        }
+        os << " Constraints:" << std::endl;
+        os << c.constraints[i];
+        os << " cost: " << c.solution[i]->cost << std::endl;
+      }
+      return os;
+    }
+  };
+
+
+ private:
+  const Environment &env_;
+  MGCBSMid middle_level_search_;
+  std::vector<HTable> h_tables_;
+};
+};  // namespace mg_cbs
