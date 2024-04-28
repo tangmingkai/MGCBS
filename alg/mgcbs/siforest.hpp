@@ -10,6 +10,7 @@
 #include "base/ts_state.hpp"
 #include "env/environment.hpp"
 namespace mg_cbs {
+// The TIS Forest in the paper
 class SIForest {
  public:
   explicit SIForest(const Environment &env) : env_(env) {}

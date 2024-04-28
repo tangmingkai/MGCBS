@@ -11,6 +11,7 @@
 #include "env/environment.hpp"
 #include <boost/heap/d_ary_heap.hpp>
 namespace mg_cbs {
+// The TIS Tree in the paper
 class SITree{
  public:
   struct SINode;
